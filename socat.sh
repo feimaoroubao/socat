@@ -6,7 +6,9 @@ export PATH
 # System Request:CentOS 6+ 、Debian 7+、Ubuntu 14+
 # Author: Rat's
 # Dscription: Socat一键脚本
-# Version: 1.9
+# Version: 2.1
+# Blog: http://www.vipkj.net
+# Github:https://github.com/lzw981731/socat
 # ====================================================
 
 Green="\033[32m"
@@ -66,7 +68,7 @@ config_socat(){
     read -p "请输入远程端口:" port2
     read -p "请输入远程IP:" socatip
 
-    # 选择协议
+    # 选择协议类型
     echo -e "${Green}请选择协议类型:${Font}"
     echo -e "1. TCP"
     echo -e "2. UDP"
@@ -89,11 +91,31 @@ config_socat(){
             ;;
     esac
 
+    # 选择IP版本
+    echo -e "${Green}请选择远程IP类型:${Font}"
+    echo -e "1. IPv4"
+    echo -e "2. IPv6"
+    read -p "请输入选择（1/2）:" ip_version_choice
+
+    case $ip_version_choice in
+        1)
+            ip_version="IPv4"
+            ;;
+        2)
+            ip_version="IPv6"
+            ;;
+        *)
+            echo "无效选择，默认使用IPv4。"
+            ip_version="IPv4"
+            ;;
+    esac
+
     # 追加配置到文件
     echo "port1=${port1}" >> $CONFIG_FILE
     echo "port2=${port2}" >> $CONFIG_FILE
     echo "socatip=${socatip}" >> $CONFIG_FILE
     echo "protocol=${protocol}" >> $CONFIG_FILE
+    echo "ip_version=${ip_version}" >> $CONFIG_FILE
     echo "------------------------" >> $CONFIG_FILE
 }
 
@@ -110,12 +132,25 @@ start_socat(){
     
     # 启动对应的 Socat 进程
     if [[ "$protocol" == "TCP" ]]; then
-        nohup socat TCP4-LISTEN:${port1},reuseaddr,fork TCP4:${socatip}:${port2} >> /root/socat.log 2>&1 &
+        if [[ "$ip_version" == "IPv4" ]]; then
+            nohup socat TCP4-LISTEN:${port1},reuseaddr,fork TCP4:${socatip}:${port2} >> /root/socat.log 2>&1 &
+        else
+            nohup socat TCP6-LISTEN:${port1},reuseaddr,fork TCP6:${socatip}:${port2} >> /root/socat.log 2>&1 &
+        fi
     elif [[ "$protocol" == "UDP" ]]; then
-        nohup socat UDP4-LISTEN:${port1},reuseaddr,fork UDP4:${socatip}:${port2} >> /root/socat.log 2>&1 &
+        if [[ "$ip_version" == "IPv4" ]]; then
+            nohup socat UDP4-LISTEN:${port1},reuseaddr,fork UDP4:${socatip}:${port2} >> /root/socat.log 2>&1 &
+        else
+            nohup socat UDP6-LISTEN:${port1},reuseaddr,fork UDP6:${socatip}:${port2} >> /root/socat.log 2>&1 &
+        fi
     elif [[ "$protocol" == "TCP+UDP" ]]; then
-        nohup socat TCP4-LISTEN:${port1},reuseaddr,fork TCP4:${socatip}:${port2} >> /root/socat.log 2>&1 &
-        nohup socat UDP4-LISTEN:${port1},reuseaddr,fork UDP4:${socatip}:${port2} >> /root/socat.log 2>&1 &
+        if [[ "$ip_version" == "IPv4" ]]; then
+            nohup socat TCP4-LISTEN:${port1},reuseaddr,fork TCP4:${socatip}:${port2} >> /root/socat.log 2>&1 &
+            nohup socat UDP4-LISTEN:${port1},reuseaddr,fork UDP4:${socatip}:${port2} >> /root/socat.log 2>&1 &
+        else
+            nohup socat TCP6-LISTEN:${port1},reuseaddr,fork TCP6:${socatip}:${port2} >> /root/socat.log 2>&1 &
+            nohup socat UDP6-LISTEN:${port1},reuseaddr,fork UDP6:${socatip}:${port2} >> /root/socat.log 2>&1 &
+        fi
     fi
 
     get_ip
@@ -125,6 +160,36 @@ start_socat(){
     echo -e "${Blue}你的本地端口为:${port1}${Font}"
     echo -e "${Blue}你的远程端口为:${port2}${Font}"
     echo -e "${Blue}你的本地服务器IP为:${ip}${Font}"
+
+    # 添加到 /etc/rc.local
+    if [[ -f /etc/rc.local ]]; then
+        if ! grep -q "socat TCP4-LISTEN:${port1},reuseaddr,fork TCP4:${socatip}:${port2}" /etc/rc.local; then
+            echo "nohup socat TCP4-LISTEN:${port1},reuseaddr,fork TCP4:${socatip}:${port2} >> /root/socat.log 2>&1 &" >> /etc/rc.local
+        fi
+        if ! grep -q "socat UDP4-LISTEN:${port1},reuseaddr,fork UDP4:${socatip}:${port2}" /etc/rc.local; then
+            echo "nohup socat UDP4-LISTEN:${port1},reuseaddr,fork UDP4:${socatip}:${port2} >> /root/socat.log 2>&1 &" >> /etc/rc.local
+        fi
+    fi
+
+    # 创建 Systemd 服务
+    cat <<EOF > /etc/systemd/system/socat.service
+[Unit]
+Description=Socat Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/socat TCP4-LISTEN:${port1},reuseaddr,fork TCP4:${socatip}:${port2}
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # 启用和启动服务
+    systemctl daemon-reload
+    systemctl enable socat.service
+    systemctl start socat.service
 }
 
 install_socat(){
@@ -155,9 +220,7 @@ query_socat(){
     # 从配置文件中读取
     if [[ -f $CONFIG_FILE ]]; then
         while IFS= read -r line; do
-            if [[ $line == *"port"* ]]; then
-                echo "$line"
-            elif [[ $line == *"protocol"* ]]; then
+            if [[ $line == *"port"* || $line == *"protocol"* || $line == *"ip_version"* ]]; then
                 echo "$line"
             elif [[ $line == *"------------------------"* ]]; then
                 echo "------------------------"
@@ -214,6 +277,25 @@ modify_socat(){
                             ;;
                     esac
                 done
+                # 读取并替换IP版本
+                echo -e "${Green}请选择远程IP类型:${Font}"
+                echo -e "1. IPv4"
+                echo -e "2. IPv6"
+                read -p "请输入选择（1/2）:" ip_version_choice
+
+                case $ip_version_choice in
+                    1)
+                        echo "ip_version=IPv4" >> "$temp_file"
+                        ;;
+                    2)
+                        echo "ip_version=IPv6" >> "$temp_file"
+                        ;;
+                    *)
+                        echo "无效选择，默认使用IPv4。"
+                        echo "ip_version=IPv4" >> "$temp_file"
+                        ;;
+                esac
+
                 echo "------------------------" >> "$temp_file"
                 # 跳过后续的旧配置
                 read -r # Skip the next lines for the old configuration
