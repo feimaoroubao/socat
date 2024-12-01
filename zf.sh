@@ -119,7 +119,9 @@ add_config() {
     read -p "请输入本地监听端口: " local_port
     read -p "请输入目标地址: " target_addr
     read -p "请输入目标端口: " target_port
-    cat <<EOF > $is_conf_dir/config.json
+    read -p "请输入备注: " comment
+
+    cat <<EOF >> $is_conf_dir/config.json
 {
   "inbounds": [
     {
@@ -129,7 +131,8 @@ add_config() {
       "settings": {
         "address": "$target_addr",
         "port": $target_port
-      }
+      },
+      "tag": "$comment"
     }
   ],
   "outbounds": [
@@ -154,6 +157,7 @@ change_config() {
     read -p "请输入要更改的本地监听端口 (空表示不更改): " local_port
     read -p "请输入要更改的目标地址 (空表示不更改): " target_addr
     read -p "请输入要更改的目标端口 (空表示不更改): " target_port
+    read -p "请输入新的备注 (空表示不更改): " comment
 
     if [[ ! -z "$local_port" ]]; then
       sed -i "s|\"port\": \([0-9]\+\)|\"port\": $local_port|g" $is_conf_dir/config.json
@@ -167,15 +171,23 @@ change_config() {
       sed -i "s|\"port\": \([0-9]\+\)|\"port\": $target_port|g" $is_conf_dir/config.json
     fi
 
+    if [[ ! -z "$comment" ]]; then
+      sed -i "s|\"tag\": \".*\"|\"tag\": \"$comment\"|g" $is_conf_dir/config.json
+    fi
+
     _green "配置已更新，已重启V2Ray服务"
     systemctl restart v2ray
 }
 
 # 删除配置
 delete_config() {
-    rm -f $is_conf_dir/config.json
-    _green "配置已删除。"
-    _green "建议添加新配置，重启V2Ray服务"
+    read -p "请输入要删除的本地监听端口: " local_port
+
+    # 使用 jq 工具删除指定端口的配置
+    jq "del(.inbounds[] | select(.port == $local_port))" $is_conf_dir/config.json > $is_conf_dir/config_temp.json
+    mv $is_conf_dir/config_temp.json $is_conf_dir/config.json
+
+    _green "端口 $local_port 的配置已删除，已重启V2Ray服务"
     systemctl restart v2ray
 }
 
