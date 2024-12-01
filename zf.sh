@@ -3,17 +3,18 @@
 # 设置颜色和输出函数
 red='\e[31m'
 green='\e[92m'
+yellow='\e[93m'
 none='\e[0m'
 _red() { echo -e ${red}$@${none}; }
 _green() { echo -e ${green}$@${none}; }
 _yellow() { echo -e ${yellow}$@${none}; }
 
 err() {
-    echo -e "\n$(_red 错误!) $@ 如果遇到问题，请检查输出或检查 V2Ray 日志。\n" && exit 1
+    _red "错误!" $1 && exit 1
 }
 
 info() {
-    echo -e "\n$(_green 提示!) $@\n"
+    _green "提示!" $1
 }
 
 # 检查根权限
@@ -95,20 +96,25 @@ select_action() {
         echo "3. 查看配置"
         echo "4. 删除配置"
         echo "5. 运行管理"
-        echo "6. 退出"
+        echo "6. 查看日志"
+        echo "7. 查看运行状态"
+        echo "8. 退出"
         read -p "请输入选项: " action
         case $action in
             1) add_config ;;
             2) change_config ;;
             3) view_config ;;
             4) delete_config ;;
-            5) run_manage ;; 
-            6) exit 0 ;;
+            5) run_manage ;;
+            6) view_logs ;;
+            7) check_v2ray_state ;;
+            8) exit 0 ;;
             *) echo "无效选项，请重新选择。" ;;
         esac
     done
 }
 
+# 添加配置
 add_config() {
     read -p "请输入本地监听端口: " local_port
     read -p "请输入目标地址: " target_addr
@@ -138,67 +144,86 @@ add_config() {
   }
 }
 EOF
-    _green "配置文件已生成。"
+
+    _green "配置文件已生成，已重启V2Ray服务"
+    systemctl restart v2ray
 }
 
+# 更改配置
 change_config() {
     read -p "请输入要更改的本地监听端口 (空表示不更改): " local_port
     read -p "请输入要更改的目标地址 (空表示不更改): " target_addr
     read -p "请输入要更改的目标端口 (空表示不更改): " target_port
+
     if [[ ! -z "$local_port" ]]; then
-        sed -i "s|\"port\": [0-9]*|\"port\": $local_port|" $is_conf_dir/config.json
+      sed -i "s|\"port\": \([0-9]\+\)|\"port\": $local_port|g" $is_conf_dir/config.json
     fi
+
     if [[ ! -z "$target_addr" ]]; then
-        sed -i "s|\"address\": \".*\"|\"address\": \"$target_addr\"|" $is_conf_dir/config.json
+      sed -i "s|\"address\": \".*\"|\"address\": \"$target_addr\"|g" $is_conf_dir/config.json
     fi
+
     if [[ ! -z "$target_port" ]]; then
-        sed -i "s|\"port\": [0-9]*|\"port\": $target_port|" $is_conf_dir/config.json
+      sed -i "s|\"port\": \([0-9]\+\)|\"port\": $target_port|g" $is_conf_dir/config.json
     fi
-    _green "配置已更新。"
+
+    _green "配置已更新，已重启V2Ray服务"
+    systemctl restart v2ray
 }
 
-view_config() {
-    if [[ -f $is_conf_dir/config.json ]]; then
-        cat $is_conf_dir/config.json
-    else
-        _green "当前没有配置文件。"
-    fi
-}
-
+# 删除配置
 delete_config() {
     rm -f $is_conf_dir/config.json
     _green "配置已删除。"
+    _green "建议添加新配置，重启V2Ray服务"
+    systemctl restart v2ray
 }
 
+# 查看配置
+view_config() {
+    if [[ -f $is_conf_dir/config.json ]]; then
+      cat $is_conf_dir/config.json
+    else
+      _red "当前没有配置文件。"
+    fi
+}
+
+# 查看运行状态
+check_v2ray_state() {
+    systemctl status v2ray
+}
+
+# 查看日志
+view_logs() {
+    if [[ -f "$is_log_dir/access.log" ]]; then
+      echo "访问日志:"
+      cat "$is_log_dir/access.log"
+    else
+      echo "找不到访问日志文件。"
+    fi
+
+    if [[ -f "$is_log_dir/error.log" ]]; then
+      echo "错误日志:"
+      cat "$is_log_dir/error.log"
+    else
+      echo "找不到错误日志文件。"
+    fi
+}
+
+# 运行管理功能
 run_manage() {
-    echo -e "1. 启动\n2. 停止\n3. 重启\n4. 返回主菜单"
-    read -p "请选择操作: " selectn
-    case $selectn in
-        1) 
-          systemctl start v2ray || { 
-            info "启动V2Ray服务失败。请检查错误日志：$(cat $is_log_dir/error.log)"; 
-            error "启动V2Ray服务失败"; 
-          }
-          _green "已经启动V2Ray。" 
-          ;;
-        2) 
-          systemctl stop v2ray 
-          _green "已停止V2Ray。" 
-          ;;
-        3) 
-          systemctl restart v2ray || {
-            _green "重启V2Ray服务失败。请检查错误日志：$(cat $is_log_dir/error.log)"; 
-            exit 1
-          }
-          _green "已重启V2Ray。" 
-          ;;
-        4) 
-          return ;;
-        *) 
-          _green "无效操作请返回主菜单选择其他动作。" 
-          ;;
+    echo -e "\n运行状态，请选择操作："
+    echo "1. 启动"
+    echo "2. 停止"
+    echo "3. 重启"
+    read -p "请输入选项: " action
+    case $action in
+        1) systemctl start v2ray ;;
+        2) systemctl stop v2ray ;;
+        3) systemctl restart v2ray ;;
+        *) echo "无效选项。" ;;
     esac
 }
 
 # 主函数开始
-select_action 
+select_action
