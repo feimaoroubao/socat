@@ -1,166 +1,204 @@
 #!/bin/bash
 
-# 安装必要的工具
-install_prerequisites() {
-    if ! command -v xray &> /dev/null; then
-        echo "Installing xray..."
-        bash <(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)
-    else
-        echo "已安装Xray."
-    fi
+# 设置颜色和输出函数
+red='\e[31m'
+green='\e[92m'
+none='\e[0m'
+_red() { echo -e ${red}$@${none}; }
+_green() { echo -e ${green}$@${none}; }
+_yellow() { echo -e ${yellow}$@${none}; }
 
-    if ! command -v jq &> /dev/null; then
-        echo "Installing jq..."
-        if command -v apt-get &> /dev/null; then
-            sudo apt-get update && sudo apt-get install -y jq
-        elif command -v yum &> /dev/null; then
-            sudo yum install -y epel-release && sudo yum install -y jq
+err() {
+    echo -e "\n$(_red 错误!) $@ 如果遇到问题，请检查输出或检查 V2Ray 日志。\n" && exit 1
+}
+
+info() {
+    echo -e "\n$(_green 提示!) $@\n"
+}
+
+# 检查根权限
+[[ $EUID -ne 0 ]] && err "请以 ROOT 用户运行此脚本."
+
+# 检查系统支持（仅支持Ubuntu, Debian, CentOS）
+if ! type -P apt-get >/dev/null && ! type -P yum >/dev/null; then
+    err "此脚本仅支持 Ubuntu, Debian 或 CentOS 系统."
+fi
+
+# 安装必要的软件包
+is_pkg="wget unzip systemd"
+for pkg in $is_pkg; do
+    if ! type -P $pkg >/dev/null; then
+        if type -P yum >/dev/null; then
+            yum install -y $pkg || err "安装 $pkg 失败"
         else
-            echo "Unsupported package manager."
+            apt-get update && apt-get -y install $pkg || err "安装 $pkg 失败"
         fi
-    else
-        echo "已安装jq."
     fi
+done
+
+# 设置路径
+is_core="v2ray"
+is_core_dir="/etc/$is_core"
+is_core_bin="$is_core_dir/bin/$is_core"
+is_conf_dir="$is_core_dir/conf"
+is_log_dir="/var/log/$is_core"
+tmp_dir="/tmp/$is_core"
+
+# 定义下载函数
+download() {
+    local url=$1
+    local path=$2
+    wget -qO $path $url || err "下载失败：$url"
 }
 
-# 检测 IP 格式
-detect_ip_version() {
-    if [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        echo "ipv4"
-    else
-        echo "ipv6"
-    fi
-}
+# 删除旧目录，创建配置目录
+if [[ -d $is_core_dir ]]; then
+    rm -rf $is_core_dir || err "无法删除旧目录 $is_core_dir，请手动删除后重试。"
+fi
+mkdir -p $is_core_dir $is_core_dir/bin $is_conf_dir $is_log_dir $tmp_dir
 
-# 添加规则函数
-add_rule() {
-    echo "请输入规则名称: "
-    read -r name
-    if [ -f "${name}.json" ]; then
-        echo "规则 $name 已存在。"
-        return
-    fi
+# 下载V2Ray
+v2ray_url="https://github.com/v2fly/v2ray-core/releases/latest/download/v2ray-linux-64.zip"
+download "$v2ray_url" "/tmp/$is_core.zip"
+unzip -oq "/tmp/$is_core.zip" -d $is_core_dir/bin
+chmod +x $is_core_bin
 
-    echo "请输入监听端口: "
-    read -r listen_port
-    if ! [[ "$listen_port" =~ ^[0-9]+$ ]] ; then
-        echo "请输入有效的端口号。"
-        return
-    fi
-    
-    echo "请输入目标IP地址: "
-    read -r target_ip
-    
-    echo "请输入目标端口: "
-    read -r target_port
-    if ! [[ "$target_port" =~ ^[0-9]+$ ]] ; then
-        echo "请输入有效的端口号。"
-        return
-    fi
+# 创建服务文件
+cat <<EOF > /etc/systemd/system/v2ray.service
+[Unit]
+Description=V2Ray Service
+After=network.target
 
-    echo "请选择协议（TCP/UDP）, 默认TCP: "
-    read -r protocol
-    protocol=${protocol:-TCP}
-    
-    ip_version=$(detect_ip_version "$target_ip")
+[Service]
+Type=simple
+ExecStart=$is_core_bin run -c $is_conf_dir/config.json
+StandardOutput=file:$is_log_dir/access.log
+StandardError=file:$is_log_dir/error.log
+Restart=always
+User=root
+LimitNOFILE=32767
+WorkingDirectory=$is_core_dir
 
-    # 设置 IPv6 地址格式
-    if [ "$ip_version" = "ipv6" ]; then
-        target_ip="[$target_ip]"
-    fi
-
-    local file="${name}.json"
-
-    cat << EOF > "$file"
-{
-  "inbounds": [{
-    "port": $listen_port,
-    "protocol": "dokodemo-door",
-    "settings": {
-      "network": "$protocol",
-      "followRedirect": true
-    },
-    "listen": "0.0.0.0"
-  }],
-  "outbounds": [{
-    "protocol": "freedom",
-    "settings": {
-      "address": "$target_ip",
-      "port": $target_port
-    }
-  }]
-}
+[Install]
+WantedBy=multi-user.target
 EOF
-    echo "已添加规则 $name"
-    xray run -c "$file" &
-}
 
-# 显示已添加规则
-list_rules() {
-    echo "已添加的规则:"
-    for rule in *.json; do
-        if [ -e "$rule" ]; then
-            echo "${rule%.json}"
-            jq -r '.inbounds[0].port, .outbounds[0].settings.address, .outbounds[0].settings.port' "$rule"
-        fi
-    done
-}
+# 重载 systemd
+systemctl daemon-reload
 
-# 删除指定的规则
-delete_rule() {
-    echo "请输入要删除的规则名称: "
-    read -r name
-    local rulefile="${name}.json"
-    if [ -f "$rulefile" ]; then
-        # 查找并杀掉与规则相关的xray进程
-        pid=$(ps ax | grep "xray run -c $rulefile" | grep -v grep | awk '{print $1}')
-        if [ -n "$pid" ]; then
-            kill $pid
-            echo "规则进程已停止"
-        fi
-        rm "$rulefile"
-        echo "规则 $name 已删除"
-    else
-        echo "规则不存在"
-    fi
-}
-
-# 测试规则是否运行
-test_rule() {
-    echo "请输入要测试的规则名称: "
-    read -r name
-    local rulefile="${name}.json"
-    if [ -f "$rulefile" ]; then
-        listen_port=$(jq -r '.inbounds[0].port' "$rulefile")
-    
-        # 使用nc（netcat）来测试端口是否可以连接
-        if command -v nc -z localhost $listen_port; then
-            echo "规则 $name 在监听端口上运行"
-        else
-            echo "规则 $name 未运行或无法连接"
-        fi
-    else
-        echo "无法找到规则文件"
-    fi
-}
-
-# 主函数
-main() {
-    install_prerequisites
-    
+# 功能选择菜单
+select_action() {
     while true; do
-        echo -e "\n1. 添加规则\n2. 查看已添加规则\n3. 删除规则\n4. 测试规则\n5. 退出"
-        read -p "请选择功能: " choice
-        
-        case $choice in
-            1) add_rule ;;
-            2) list_rules ;;
-            3) delete_rule ;;
-            4) test_rule ;;
-            5) break ;;
-            *) echo "无效选项，请重试。" ;;
+        echo -e "\n选择动作："
+        echo "1. 添加配置"
+        echo "2. 更改配置"
+        echo "3. 查看配置"
+        echo "4. 删除配置"
+        echo "5. 运行管理"
+        echo "6. 退出"
+        read -p "请输入选项: " action
+        case $action in
+            1) add_config ;;
+            2) change_config ;;
+            3) view_config ;;
+            4) delete_config ;;
+            5) run_manage ;; 
+            6) exit 0 ;;
+            *) echo "无效选项，请重新选择。" ;;
         esac
     done
 }
 
-main
+add_config() {
+    read -p "请输入本地监听端口: " local_port
+    read -p "请输入目标地址: " target_addr
+    read -p "请输入目标端口: " target_port
+    cat <<EOF > $is_conf_dir/config.json
+{
+  "inbounds": [
+    {
+      "port": $local_port,
+      "listen": "0.0.0.0",
+      "protocol": "dokodemo-door",
+      "settings": {
+        "address": "$target_addr",
+        "port": $target_port
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom"
+    }
+  ],
+  "log": {
+    "loglevel": "info",
+    "access": "$is_log_dir/access.log",
+    "error": "$is_log_dir/error.log"
+  }
+}
+EOF
+    _green "配置文件已生成。"
+}
+
+change_config() {
+    read -p "请输入要更改的本地监听端口 (空表示不更改): " local_port
+    read -p "请输入要更改的目标地址 (空表示不更改): " target_addr
+    read -p "请输入要更改的目标端口 (空表示不更改): " target_port
+    if [[ ! -z "$local_port" ]]; then
+        sed -i "s|\"port\": [0-9]*|\"port\": $local_port|" $is_conf_dir/config.json
+    fi
+    if [[ ! -z "$target_addr" ]]; then
+        sed -i "s|\"address\": \".*\"|\"address\": \"$target_addr\"|" $is_conf_dir/config.json
+    fi
+    if [[ ! -z "$target_port" ]]; then
+        sed -i "s|\"port\": [0-9]*|\"port\": $target_port|" $is_conf_dir/config.json
+    fi
+    _green "配置已更新。"
+}
+
+view_config() {
+    if [[ -f $is_conf_dir/config.json ]]; then
+        cat $is_conf_dir/config.json
+    else
+        _green "当前没有配置文件。"
+    fi
+}
+
+delete_config() {
+    rm -f $is_conf_dir/config.json
+    _green "配置已删除。"
+}
+
+run_manage() {
+    echo -e "1. 启动\n2. 停止\n3. 重启\n4. 返回主菜单"
+    read -p "请选择操作: " selectn
+    case $selectn in
+        1) 
+          systemctl start v2ray || { 
+            info "启动V2Ray服务失败。请检查错误日志：$(cat $is_log_dir/error.log)"; 
+            error "启动V2Ray服务失败"; 
+          }
+          _green "已经启动V2Ray。" 
+          ;;
+        2) 
+          systemctl stop v2ray 
+          _green "已停止V2Ray。" 
+          ;;
+        3) 
+          systemctl restart v2ray || {
+            _green "重启V2Ray服务失败。请检查错误日志：$(cat $is_log_dir/error.log)"; 
+            exit 1
+          }
+          _green "已重启V2Ray。" 
+          ;;
+        4) 
+          return ;;
+        *) 
+          _green "无效操作请返回主菜单选择其他动作。" 
+          ;;
+    esac
+}
+
+# 主函数开始
+select_action 
