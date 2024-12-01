@@ -1,167 +1,164 @@
 #!/bin/bash
 
-RULES_FILE="forwarding_rules.json"
-
-# 检查并安装 jq 和 nc
-if ! command -v jq &> /dev/null
-then
-    echo "jq 未安装。正在安装 jq..."
-    if [ -x "$(command -v apt-get)" ]; then
-        sudo apt-get update && sudo apt-get install -y jq
-    elif [ -x "$(command -v yum)" ]; then
-        sudo yum install -y epel-release && sudo yum install -y jq
+# 安装必要的工具
+install_prerequisites() {
+    if ! command -v xray &> /dev/null; then
+        echo "Installing xray..."
+        bash <(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)
     else
-        echo "无法自动安装 jq，请手动安装。"
-        exit 1
-    fi
-fi
-
-if ! command -v nc &> /dev/null
-then
-    echo "nc 未安装。正在安装 nc..."
-    if [ -x "$(command -v apt-get)" ]; then
-        sudo apt-get update && sudo apt-get install -y netcat
-    elif [ -x "$(command -v yum)" ]; then
-        sudo yum install -y nc
-    else
-        echo "无法自动安装 nc，请手动安装。"
-        exit 1
-    fi
-fi
-
-# 创建记录文件
-if [ ! -f $RULES_FILE ]; then
-    echo "{}" > $RULES_FILE
-fi
-
-function save_rule {
-    jq --argjson rule "$1" '.[$rule.local_port] = $rule' $RULES_FILE > tmp.$$.json && mv tmp.$$.json $RULES_FILE
-    echo "规则已保存：$1"
-}
-
-function delete_rule {
-    jq --arg local_port "$1" 'del(.[$local_port])' $RULES_FILE > tmp.$$.json && mv tmp.$$.json $RULES_FILE
-    echo "规则已删除：本地端口 $1"
-
-    # 终止占用端口的进程
-    pid=$(netstat -tulnp 2>/dev/null | grep ":$1" | awk '{print $7}' | cut -d'/' -f1)
-    if [ ! -z "$pid" ]; then
-        sudo kill $pid
-        echo "已终止占用端口的进程 PID: $pid"
+        echo "已安装Xray."
     fi
 
-    # 删除防火墙规则
-    sudo iptables -D INPUT -p tcp --dport "$1" -j ACCEPT
-    sudo ip6tables -D INPUT -p tcp --dport "$1" -j ACCEPT
-}
-
-function list_rules {
-    echo "当前转发规则："
-    jq '.' $RULES_FILE
-}
-
-function check_forwarding {
-    echo "正在检查转发规则状态..."
-    rules=$(jq -c '.' $RULES_FILE)
-    for rule in $(echo "${rules}" | jq -c 'to_entries[]'); do
-        local_port=$(echo "${rule}" | jq -r '.key')
-        target_ip=$(echo "${rule}" | jq -r '.value.target_ip')
-        echo "检查本地端口 ${local_port} 转发到 ${target_ip} 的状态..."
-        if nc -z -v -w5 127.0.0.1 ${local_port}; then
-            echo "转发状态：正常"
+    if ! command -v jq &> /dev/null; then
+        echo "Installing jq..."
+        if command -v apt-get &> /dev/null; then
+            sudo apt-get update && sudo apt-get install -y jq
+        elif command -v yum &> /dev/null; then
+            sudo yum install -y epel-release && sudo yum install -y jq
         else
-            echo "转发状态：异常"
+            echo "Unsupported package manager."
+        fi
+    else
+        echo "已安装jq."
+    fi
+}
+
+# 检测 IP 格式
+detect_ip_version() {
+    if [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "ipv4"
+    else
+        echo "ipv6"
+    fi
+}
+
+# 添加规则函数
+add_rule() {
+    echo "请输入规则名称: "
+    read -r name
+    if [ -f "${name}.json" ]; then
+        echo "规则 $name 已存在。"
+        return
+    fi
+
+    echo "请输入监听端口: "
+    read -r listen_port
+    if ! [[ "$listen_port" =~ ^[0-9]+$ ]] ; then
+        echo "请输入有效的端口号。"
+        return
+    fi
+    
+    echo "请输入目标IP地址: "
+    read -r target_ip
+    
+    echo "请输入目标端口: "
+    read -r target_port
+    if ! [[ "$target_port" =~ ^[0-9]+$ ]] ; then
+        echo "请输入有效的端口号。"
+        return
+    fi
+
+    echo "请选择协议（TCP/UDP）, 默认TCP: "
+    read -r protocol
+    protocol=${protocol:-TCP}
+    
+    ip_version=$(detect_ip_version "$target_ip")
+
+    # 设置 IPv6 地址格式
+    if [ "$ip_version" = "ipv6" ]; then
+        target_ip="[$target_ip]"
+    fi
+
+    local file="${name}.json"
+
+    cat << EOF > "$file"
+{
+  "inbounds": [{
+    "port": $listen_port,
+    "protocol": "dokodemo-door",
+    "settings": {
+      "network": "$protocol",
+      "followRedirect": true
+    },
+    "listen": "0.0.0.0"
+  }],
+  "outbounds": [{
+    "protocol": "freedom",
+    "settings": {
+      "address": "$target_ip",
+      "port": $target_port
+    }
+  }]
+}
+EOF
+    echo "已添加规则 $name"
+    xray run -c "$file" &
+}
+
+# 显示已添加规则
+list_rules() {
+    echo "已添加的规则:"
+    for rule in *.json; do
+        if [ -e "$rule" ]; then
+            echo "${rule%.json}"
+            jq -r '.inbounds[0].port, .outbounds[0].settings.address, .outbounds[0].settings.port' "$rule"
         fi
     done
 }
 
-function add_rule {
-    read -p "请输入转发规则名称: " name
-    echo "请选择协议类型: [1] TCP  [2] UDP  [3] TCP/UDP"
-    read -p "请输入选择 (1/2/3): " protocol_choice
-
-    case $protocol_choice in
-        1)
-            protocol="TCP"
-            ;;
-        2)
-            protocol="UDP"
-            ;;
-        3)
-            protocol="TCP/UDP"
-            ;;
-        *)
-            echo "无效选择。请输入1、2或3。"
-            return
-            ;;
-    esac
-
-    read -p "请输入本地端口: " local_port
-    read -p "请输入目标 IP: " target_ip
-    read -p "请输入目标端口: " target_port
-
-    # 检查是否是 IPv6 地址，如果是则添加方括号
-    if [[ $target_ip =~ .*:.* ]]; then
-        target_ip="[$target_ip]"
-    fi
-
-    # 清理旧的转发规则
-    delete_rule "$local_port"
-
-    # 终止所有 socat 进程
-    sudo pkill socat
-
-    rule=$(jq -n --arg name "$name" --arg protocol "$protocol" --arg local_port "$local_port" --arg target_ip "$target_ip" --arg target_port "$target_port" '{name: $name, protocol: $protocol, local_port: $local_port, target_ip: $target_ip, target_port: $target_port}')
-    save_rule "$rule"
-
-    # 添加防火墙规则
-    sudo iptables -I INPUT -p tcp --dport "$local_port" -j ACCEPT
-    sudo ip6tables -I INPUT -p tcp --dport "$local_port" -j ACCEPT
-
-    if [[ "$protocol" == "TCP" || "$protocol" == "TCP/UDP" ]]; then
-        socat -d -d TCP4-LISTEN:$local_port,fork TCP:$target_ip:$target_port &
-        echo "TCP 转发已添加：本地端口 $local_port 到 $target_ip:$target_port"
-    fi
-
-    if [[ "$protocol" == "UDP" || "$protocol" == "TCP/UDP" ]]; then
-        socat -d -d UDP4-LISTEN:$local_port,fork UDP:$target_ip:$target_port &
-        echo "UDP 转发已添加：本地端口 $local_port 到 $target_ip:$target_port"
+# 删除指定的规则
+delete_rule() {
+    echo "请输入要删除的规则名称: "
+    read -r name
+    local rulefile="${name}.json"
+    if [ -f "$rulefile" ]; then
+        # 查找并杀掉与规则相关的xray进程
+        pid=$(ps ax | grep "xray run -c $rulefile" | grep -v grep | awk '{print $1}')
+        if [ -n "$pid" ]; then
+            kill $pid
+            echo "规则进程已停止"
+        fi
+        rm "$rulefile"
+        echo "规则 $name 已删除"
+    else
+        echo "规则不存在"
     fi
 }
 
-function modify_rule {
-    read -p "请输入要修改的本地端口: " local_port
-    delete_rule "$local_port"
-    add_rule
+# 测试规则是否运行
+test_rule() {
+    echo "请输入要测试的规则名称: "
+    read -r name
+    local rulefile="${name}.json"
+    if [ -f "$rulefile" ]; then
+        listen_port=$(jq -r '.inbounds[0].port' "$rulefile")
+    
+        # 使用nc（netcat）来测试端口是否可以连接
+        if command -v nc -z localhost $listen_port; then
+            echo "规则 $name 在监听端口上运行"
+        else
+            echo "规则 $name 未运行或无法连接"
+        fi
+    else
+        echo "无法找到规则文件"
+    fi
 }
 
-function main {
+# 主函数
+main() {
+    install_prerequisites
+    
     while true; do
-        echo "选项: [1] 添加规则  [2] 列出规则  [3] 删除规则  [4] 修改规则 [5] 检查转发状态 [6] 退出"
-        read -p "请输入您的选择: " choice
+        echo -e "\n1. 添加规则\n2. 查看已添加规则\n3. 删除规则\n4. 测试规则\n5. 退出"
+        read -p "请选择功能: " choice
+        
         case $choice in
-            1)
-                add_rule
-                ;;
-            2)
-                list_rules
-                ;;
-            3)
-                read -p "请输入要删除的本地端口: " local_port
-                delete_rule "$local_port"
-                ;;
-            4)
-                modify_rule
-                ;;
-            5)
-                check_forwarding
-                ;;
-            6)
-                break
-                ;;
-            *)
-                echo "无效选择。请输入1到6之间的数字。"
-                ;;
+            1) add_rule ;;
+            2) list_rules ;;
+            3) delete_rule ;;
+            4) test_rule ;;
+            5) break ;;
+            *) echo "无效选项，请重试。" ;;
         esac
     done
 }
