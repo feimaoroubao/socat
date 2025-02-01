@@ -10,11 +10,11 @@ _green() { echo -e ${green}$@${none}; }
 _yellow() { echo -e ${yellow}$@${none}; }
 
 err() {
-    _red "错误!" $1 && exit 1
+    _red "错误! " $1 && exit 1
 }
 
 info() {
-    _green "提示!" $1
+    _green "提示! " $1
 }
 
 # 检查根权限
@@ -26,7 +26,7 @@ if ! type -P apt-get >/dev/null && ! type -P yum >/dev/null; then
 fi
 
 # 安装必要的软件包
-is_pkg="wget unzip systemd"
+is_pkg="wget unzip jq"
 for pkg in $is_pkg; do
     if ! type -P $pkg >/dev/null; then
         if type -P yum >/dev/null; then
@@ -52,20 +52,23 @@ download() {
     wget -qO $path $url || err "下载失败：$url"
 }
 
-# 删除旧目录，创建配置目录
-if [[ -d $is_core_dir ]]; then
-    rm -rf $is_core_dir || err "无法删除旧目录 $is_core_dir，请手动删除后重试。"
-fi
-mkdir -p $is_core_dir $is_core_dir/bin $is_conf_dir $is_log_dir $tmp_dir
+# 初始化目录结构
+init_dirs() {
+    rm -rf $tmp_dir
+    mkdir -p $is_core_dir $is_core_dir/bin $is_conf_dir $is_log_dir $tmp_dir
+}
 
-# 下载V2Ray
-v2ray_url="https://github.com/v2fly/v2ray-core/releases/latest/download/v2ray-linux-64.zip"
-download "$v2ray_url" "/tmp/$is_core.zip"
-unzip -oq "/tmp/$is_core.zip" -d $is_core_dir/bin
-chmod +x $is_core_bin
+# 安装/更新V2Ray核心
+install_v2ray() {
+    v2ray_url="https://github.com/v2fly/v2ray-core/releases/latest/download/v2ray-linux-64.zip"
+    download "$v2ray_url" "/tmp/$is_core.zip"
+    unzip -oq "/tmp/$is_core.zip" -d $is_core_dir/bin
+    chmod +x $is_core_bin
+}
 
 # 创建服务文件
-cat <<EOF > /etc/systemd/system/v2ray.service
+create_service() {
+    cat <<EOF > /etc/systemd/system/v2ray.service
 [Unit]
 Description=V2Ray Service
 After=network.target
@@ -83,159 +86,216 @@ WorkingDirectory=$is_core_dir
 [Install]
 WantedBy=multi-user.target
 EOF
+    systemctl daemon-reload
+}
 
-# 重载 systemd
-systemctl daemon-reload
+# 初始化配置文件
+init_config() {
+    if [[ ! -f $is_conf_dir/config.json ]]; then
+        echo '{
+  "inbounds": [],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "settings": {}
+    }
+  ]
+}' > $is_conf_dir/config.json
+    fi
+}
 
-# 功能选择菜单
-select_action() {
-    while true; do
-        echo -e "\n选择动作："
-        echo "1. 添加配置"
-        echo "2. 更改配置"
-        echo "3. 查看配置"
-        echo "4. 删除配置"
-        echo "5. 运行管理"
-        echo "6. 查看日志"
-        echo "7. 查看运行状态"
-        echo "8. 退出"
-        read -p "请输入选项: " action
-        case $action in
-            1) add_config ;;
-            2) change_config ;;
-            3) view_config ;;
-            4) delete_config ;;
-            5) run_manage ;;
-            6) view_logs ;;
-            7) check_v2ray_state ;;
-            8) exit 0 ;;
-            *) echo "无效选项，请重新选择。" ;;
-        esac
-    done
+# 端口冲突检测
+check_port_conflict() {
+    local port=$1
+    ss -tuln | grep -q ":${port} " && err "端口 $port 已被占用"
+}
+
+# 输入验证
+validate_number() {
+    local num=$1
+    [[ "$num" =~ ^[0-9]+$ ]] || err "请输入有效数字"
+    (( num >= 1 && num <= 65535 )) || err "端口范围应为 1-65535"
+}
+
+validate_ip() {
+    local ip=$1
+    if ! [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        err "请输入有效的 IPv4 地址"
+    fi
 }
 
 # 添加配置
 add_config() {
-    read -p "请输入本地监听端口: " local_port
-    read -p "请输入目标地址: " target_addr
-    read -p "请输入目标端口: " target_port
-    read -p "请输入备注: " comment
+    while true; do
+        read -p "请输入本地监听端口 (1-65535): " local_port
+        validate_number $local_port
+        check_port_conflict $local_port
+        break
+    done
 
-    cat <<EOF >> $is_conf_dir/config.json
-{
-  "inbounds": [
-    {
-      "port": $local_port,
-      "listen": "0.0.0.0",
-      "protocol": "dokodemo-door",
-      "settings": {
-        "address": "$target_addr",
-        "port": $target_port
-      },
-      "tag": "$comment"
-    }
-  ],
-  "outbounds": [
-    {
-      "protocol": "freedom"
-    }
-  ],
-  "log": {
-    "loglevel": "info",
-    "access": "$is_log_dir/access.log",
-    "error": "$is_log_dir/error.log"
-  }
-}
-EOF
+    while true; do
+        read -p "请输入目标地址 (IP): " target_addr
+        validate_ip $target_addr
+        break
+    done
 
-    _green "配置文件已生成，已重启V2Ray服务"
+    while true; do
+        read -p "请输入目标端口 (1-65535): " target_port
+        validate_number $target_port
+        break
+    done
+
+    read -p "请输入备注 (可选): " comment
+
+    # 使用 jq 添加配置
+    jq ".inbounds += [{
+        \"port\": $local_port,
+        \"listen\": \"0.0.0.0\",
+        \"protocol\": \"dokodemo-door\",
+        \"settings\": {
+            \"address\": \"$target_addr\",
+            \"port\": $target_port
+        },
+        \"tag\": \"$comment\"
+    }]" $is_conf_dir/config.json > $tmp_dir/config.tmp
+
+    mv $tmp_dir/config.tmp $is_conf_dir/config.json
+    info "规则已添加"
     systemctl restart v2ray
+    check_service
 }
 
-# 更改配置
+# 修改配置
 change_config() {
-    read -p "请输入要更改的本地监听端口 (空表示不更改): " local_port
-    read -p "请输入要更改的目标地址 (空表示不更改): " target_addr
-    read -p "请输入要更改的目标端口 (空表示不更改): " target_port
-    read -p "请输入新的备注 (空表示不更改): " comment
+    list_configs
+    read -p "请输入要修改的本地端口: " old_port
+    validate_number $old_port
 
-    if [[ ! -z "$local_port" ]]; then
-      sed -i "s|\"port\": \([0-9]\+\)|\"port\": $local_port|g" $is_conf_dir/config.json
+    # 检查配置是否存在
+    if ! jq -e ".inbounds[] | select(.port == $old_port)" $is_conf_dir/config.json >/dev/null; then
+        err "未找到端口 $old_port 的配置"
     fi
 
-    if [[ ! -z "$target_addr" ]]; then
-      sed -i "s|\"address\": \".*\"|\"address\": \"$target_addr\"|g" $is_conf_dir/config.json
-    fi
+    # 获取旧配置
+    old_config=$(jq ".inbounds[] | select(.port == $old_port)" $is_conf_dir/config.json)
 
-    if [[ ! -z "$target_port" ]]; then
-      sed -i "s|\"port\": \([0-9]\+\)|\"port\": $target_port|g" $is_conf_dir/config.json
-    fi
+    # 读取新值
+    read -p "新本地端口 [当前: $(jq -r '.port' <<< "$old_config")]: " new_port
+    [[ -z "$new_port" ]] && new_port=$(jq -r '.port' <<< "$old_config")
+    validate_number $new_port
 
-    if [[ ! -z "$comment" ]]; then
-      sed -i "s|\"tag\": \".*\"|\"tag\": \"$comment\"|g" $is_conf_dir/config.json
-    fi
+    read -p "新目标地址 [当前: $(jq -r '.settings.address' <<< "$old_config")]: " target_addr
+    [[ -z "$target_addr" ]] && target_addr=$(jq -r '.settings.address' <<< "$old_config")
+    validate_ip $target_addr
 
-    _green "配置已更新，已重启V2Ray服务"
+    read -p "新目标端口 [当前: $(jq -r '.settings.port' <<< "$old_config")]: " target_port
+    [[ -z "$target_port" ]] && target_port=$(jq -r '.settings.port' <<< "$old_config")
+    validate_number $target_port
+
+    read -p "新备注 [当前: $(jq -r '.tag' <<< "$old_config")]: " comment
+    [[ -z "$comment" ]] && comment=$(jq -r '.tag' <<< "$old_config")
+
+    # 使用 jq 更新配置
+    jq "(.inbounds[] | select(.port == $old_port)) |= 
+    .port = $new_port |
+    .settings.address = \"$target_addr\" |
+    .settings.port = $target_port |
+    .tag = \"$comment\"" $is_conf_dir/config.json > $tmp_dir/config.tmp
+
+    mv $tmp_dir/config.tmp $is_conf_dir/config.json
+    info "配置已更新"
     systemctl restart v2ray
+    check_service
 }
 
 # 删除配置
 delete_config() {
-    read -p "请输入要删除的本地监听端口: " local_port
+    list_configs
+    read -p "请输入要删除的本地端口: " del_port
+    validate_number $del_port
 
-    # 使用 jq 工具删除指定端口的配置
-    jq "del(.inbounds[] | select(.port == $local_port))" $is_conf_dir/config.json > $is_conf_dir/config_temp.json
-    mv $is_conf_dir/config_temp.json $is_conf_dir/config.json
-
-    _green "端口 $local_port 的配置已删除，已重启V2Ray服务"
+    jq "del(.inbounds[] | select(.port == $del_port))" $is_conf_dir/config.json > $tmp_dir/config.tmp
+    mv $tmp_dir/config.tmp $is_conf_dir/config.json
+    info "端口 $del_port 的配置已删除"
     systemctl restart v2ray
+    check_service
 }
 
-# 查看配置
-view_config() {
-    if [[ -f $is_conf_dir/config.json ]]; then
-      cat $is_conf_dir/config.json
-    else
-      _red "当前没有配置文件。"
+# 列出所有配置
+list_configs() {
+    echo -e "\n当前转发规则："
+    jq -r '.inbounds[] | "端口：\(.port) => \(.settings.address):\(.settings.port) [备注：\(.tag)]"' $is_conf_dir/config.json
+    echo
+}
+
+# 检查服务状态
+check_service() {
+    if ! systemctl is-active --quiet v2ray; then
+        _yellow "服务启动失败，请检查配置！"
+        journalctl -u v2ray -n 10 --no-pager
+        exit 1
     fi
 }
 
-# 查看运行状态
-check_v2ray_state() {
-    systemctl status v2ray
-}
-
-# 查看日志
-view_logs() {
-    if [[ -f "$is_log_dir/access.log" ]]; then
-      echo "访问日志:"
-      cat "$is_log_dir/access.log"
-    else
-      echo "找不到访问日志文件。"
-    fi
-
-    if [[ -f "$is_log_dir/error.log" ]]; then
-      echo "错误日志:"
-      cat "$is_log_dir/error.log"
-    else
-      echo "找不到错误日志文件。"
-    fi
-}
-
-# 运行管理功能
-run_manage() {
-    echo -e "\n运行状态，请选择操作："
-    echo "1. 启动"
-    echo "2. 停止"
-    echo "3. 重启"
-    read -p "请输入选项: " action
-    case $action in
-        1) systemctl start v2ray ;;
-        2) systemctl stop v2ray ;;
-        3) systemctl restart v2ray ;;
-        *) echo "无效选项。" ;;
+# 服务管理菜单
+service_menu() {
+    echo -e "\n服务管理："
+    echo "1. 启动服务"
+    echo "2. 停止服务"
+    echo "3. 重启服务"
+    echo "4. 查看状态"
+    echo "5. 返回主菜单"
+    
+    read -p "请选择操作: " choice
+    case $choice in
+        1) systemctl start v2ray;;
+        2) systemctl stop v2ray;;
+        3) systemctl restart v2ray;;
+        4) systemctl status v2ray;;
+        5) return;;
+        *) _red "无效选项";;
     esac
 }
 
-# 主函数开始
-select_action
+# 主菜单
+main_menu() {
+    while true; do
+        echo -e "\nV2Ray 透明代理管理"
+        echo "1. 添加转发规则"
+        echo "2. 修改转发规则"
+        echo "3. 删除转发规则"
+        echo "4. 列出所有规则"
+        echo "5. 服务管理"
+        echo "6. 退出"
+        
+        read -p "请选择操作: " choice
+        case $choice in
+            1) add_config;;
+            2) change_config;;
+            3) delete_config;;
+            4) list_configs;;
+            5) service_menu;;
+            6) exit 0;;
+            *) _red "无效选项";;
+        esac
+    done
+}
+
+# 初始化安装流程
+init_install() {
+    init_dirs
+    install_v2ray
+    create_service
+    init_config
+    info "V2Ray 安装完成"
+}
+
+# 主流程
+if [[ ! -f $is_core_bin ]]; then
+    init_install
+else
+    systemctl stop v2ray 2>/dev/null
+    install_v2ray
+fi
+
+main_menu
