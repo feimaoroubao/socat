@@ -119,8 +119,14 @@ validate_number() {
 
 validate_ip() {
     local ip=$1
-    if ! [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        err "请输入有效的 IPv4 地址"
+    # IPv4验证
+    if [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        return 0
+    # 基本IPv6格式验证（允许简写形式）
+    elif [[ $ip =~ ^[0-9a-fA-F:]+$ ]] && [[ $ip == *:* ]]; then
+        return 0
+    else
+        err "请输入有效的 IPv4 或 IPv6 地址"
     fi
 }
 
@@ -134,8 +140,8 @@ add_config() {
     done
 
     while true; do
-        read -p "请输入目标地址 (IP): " target_addr
-        validate_ip $target_addr
+        read -p "请输入目标地址 (支持IPv4/IPv6): " target_addr
+        validate_ip "$target_addr"
         break
     done
 
@@ -186,7 +192,7 @@ change_config() {
 
     read -p "新目标地址 [当前: $(jq -r '.settings.address' <<< "$old_config")]: " target_addr
     [[ -z "$target_addr" ]] && target_addr=$(jq -r '.settings.address' <<< "$old_config")
-    validate_ip $target_addr
+    validate_ip "$target_addr"
 
     read -p "新目标端口 [当前: $(jq -r '.settings.port' <<< "$old_config")]: " target_port
     [[ -z "$target_port" ]] && target_port=$(jq -r '.settings.port' <<< "$old_config")
@@ -214,8 +220,8 @@ delete_config() {
     read -p "请输入要删除的本地端口: " del_port
     validate_number $del_port
 
-    jq "del(.inbounds[] | select(.port == $del_port))" $is_conf_dir/config.json > $tmp_dir/config.tmp
-    mv $tmp_dir/config.tmp $is_conf_dir/config.json
+    jq "del(.inbounds[] | select(.port == $del_port))" $is_core_dir/conf/config.json > $tmp_dir/config.tmp
+    mv $tmp_dir/config.tmp $is_core_dir/conf/config.json
     info "端口 $del_port 的配置已删除"
     systemctl restart v2ray
     check_service
